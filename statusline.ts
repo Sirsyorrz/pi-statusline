@@ -228,38 +228,39 @@ export default function (pi: ExtensionAPI) {
 						pollUsage().then(() => tui.requestRender()).catch(() => {});
 					}
 
-					// ── left: dir + branch ─────────────────────────────────
+					// ── helpers ───────────────────────────────────────────
+					const D   = (s: string) => theme.fg("dim", s);   // dim text
+					const SEP = D(" · ");                            // segment separator
+					const pct = (n: number) => theme.fg(pctColor(n), `(${n}%)`);
+
+					// ── left: dir + branch ────────────────────────────────
 					const dir    = fmtDir(activeCtx.cwd);
 					const branch = footerData.getGitBranch() ?? "no git";
 
 					const left =
 						" " +
 						theme.fg("text", dir) +
-						theme.fg("dim", "  ⎇ ") +
+						D(" ⎇ ") +
 						theme.fg("accent", branch);
 
-					// ── right: usage percentages + model ──────────────────
+					// ── right segments ────────────────────────────────────
 					const model = activeCtx.model?.id ?? "no model";
 					const usage = activeCtx.getContextUsage();
 
-					// ctx: show "used/total" token counts
 					const ctxTokens = usage?.tokens ?? null;
 					const ctxWindow = usage?.contextWindow ?? 0;
 					const ctxPct    = Math.min(100, Math.round(usage?.percent ?? 0));
-					const ctxStr    = ctxTokens !== null && ctxWindow > 0
+					const ctxVal    = ctxTokens !== null && ctxWindow > 0
 						? `${fmtTokens(ctxTokens)}/${fmtTokens(ctxWindow)}`
-						: ctxWindow > 0 ? `?/${fmtTokens(ctxWindow)}` : "ctx ?";
+						: ctxWindow > 0 ? `?/${fmtTokens(ctxWindow)}` : "?";
 
-					const SEP = theme.fg("dim", "  ");
-
-					let right =
-						theme.fg("syntaxKeyword", "ctx ") +
-						theme.fg(pctColor(ctxPct), ctxStr);
+					const segments: string[] = [
+						D("ctx ") + theme.fg(pctColor(ctxPct), ctxVal),
+					];
 
 					// API-sourced rate-limit utilization from cc-usage
 					if (noCredentials) {
-						// ~/.claude/.credentials.json not found — OAuth login required
-						right += SEP + theme.fg("dim", "cc:no creds");
+						segments.push(D("no oauth"));
 					} else if (usageData) {
 						const fiveHour = usageData.five_hour?.utilization;
 						const sevenDay = usageData.seven_day?.utilization;
@@ -267,37 +268,28 @@ export default function (pi: ExtensionAPI) {
 						const extra    = usageData.extra_usage;
 
 						if (typeof fiveHour === "number") {
-							const pct      = Math.min(999, Math.floor(fiveHour));
 							const resetStr = fmtResetIn(usageData.five_hour?.resets_at);
-							right += SEP +
-								theme.fg("syntaxFunction", "5h ") +
-								theme.fg(pctColor(pct), `${pct}%`) +
-								(resetStr ? " " + theme.fg("dim", resetStr) : "");
+							segments.push(
+								D("5h ") + pct(Math.min(999, Math.floor(fiveHour))) +
+								(resetStr ? " " + D(resetStr) : ""),
+							);
 						}
 						if (typeof sevenDay === "number") {
-							const pct = Math.min(999, Math.floor(sevenDay));
-							right += SEP +
-								theme.fg("syntaxVariable", "7d ") +
-								theme.fg(pctColor(pct), `${pct}%`);
+							segments.push(D("7d ") + pct(Math.min(999, Math.floor(sevenDay))));
 						}
 						if (typeof snt === "number") {
-							const pct = Math.min(999, Math.floor(snt));
-							right += SEP +
-								theme.fg("dim", "snt ") +
-								theme.fg(pctColor(pct), `${pct}%`);
+							segments.push(D("snt ") + pct(Math.min(999, Math.floor(snt))));
 						}
 						if (extra?.is_enabled && typeof extra.utilization === "number") {
-							const pct = Math.min(999, Math.floor(extra.utilization));
-							right += SEP +
-								theme.fg("dim", "ext ") +
-								theme.fg(pctColor(pct), `${pct}%`);
+							segments.push(D("ext ") + pct(Math.min(999, Math.floor(extra.utilization))));
 						}
 					} else {
-						// Credentials present but no data yet (first fetch in progress)
-						right += SEP + theme.fg("dim", "cc:…");
+						segments.push(D("…"));
 					}
 
-					right += SEP + theme.fg("syntaxType", model) + " ";
+					segments.push(theme.fg("text", model));
+
+					const right = " " + segments.join(SEP) + " ";
 
 					// ── pad between left and right ─────────────────────────
 					const gap  = Math.max(1, width - visibleWidth(left) - visibleWidth(right));
