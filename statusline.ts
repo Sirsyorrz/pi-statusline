@@ -81,7 +81,7 @@ export default function (pi: ExtensionAPI) {
 						" " +
 						theme.fg("text", dir) +
 						theme.fg("dim", "  ⎇ ") +
-						theme.fg("muted", branch);
+						theme.fg("accent", branch);
 
 					// ── right: usage percentages + model ──────────────────
 					const model = activeCtx.model?.id ?? "no model";
@@ -99,10 +99,10 @@ export default function (pi: ExtensionAPI) {
 					const SEP = theme.fg("dim", "  ");
 
 					const right =
-						theme.fg("dim", "ctx ") + theme.fg(pctColor(ctxPct), `${ctxPct}%`) + SEP +
-						theme.fg("dim", "5h ")  + theme.fg(pctColor(pct5h),  `${pct5h}%`)  + SEP +
-						theme.fg("dim", "wk ")  + theme.fg(pctColor(pctWk),  `${pctWk}%`)  + SEP +
-						theme.fg("muted", model) +
+						theme.fg("syntaxKeyword",  "Context ") + theme.fg(pctColor(ctxPct), `${ctxPct}%`) + SEP +
+						theme.fg("syntaxFunction", "5h ")      + theme.fg(pctColor(pct5h),  `${pct5h}%`)  + SEP +
+						theme.fg("syntaxVariable", "wk ")      + theme.fg(pctColor(pctWk),  `${pctWk}%`)  + SEP +
+						theme.fg("syntaxType", model) +
 						" ";
 
 					// ── pad between left and right ─────────────────────────
