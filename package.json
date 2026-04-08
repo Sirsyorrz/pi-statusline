@@ -4,6 +4,7 @@
   "description": "Clean one-line status bar for pi with Anthropic API rate-limit utilization via cc-usage",
   "keywords": ["pi-package"],
   "license": "MIT",
+  "files": ["statusline.ts"],
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
