@@ -11,7 +11,7 @@
  * snt  — Sonnet-only 7-day window utilization from Anthropic API.
  * ext  — extra usage/credits utilization (shown only when enabled).
  *
- * Rate-limit data is fetched from the Anthropic OAuth usage endpoint every 30 s.
+ * Rate-limit data is fetched from the Anthropic OAuth usage endpoint every 5 minutes.
  * Requires ~/.claude/.credentials.json (populated automatically by Claude Code).
  * Falls back to showing nothing for those fields if credentials are absent.
  *
@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { readFileSync, writeFileSync } from "node:fs";
 
 // ─── cc-usage config (mirrors burneikis/cc-usage) ───────────────────────────
-const POLL_INTERVAL_MS = 60_000;
+const POLL_INTERVAL_MS = 300_000; // 5 minutes
 const API_URL          = "https://api.anthropic.com/api/oauth/usage";
 const TOKEN_URL        = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID        = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -142,6 +142,7 @@ let usageData: UsageData | null = null;
 let lastFetchTime  = 0;
 let isFetching     = false;
 let noCredentials  = false;   // true once we've confirmed creds are absent
+let fetchErrorCount = 0;      // consecutive failures; hides the spinner after a few tries
 
 async function pollUsage(): Promise<void> {
 	if (isFetching) return;
@@ -158,10 +159,12 @@ async function pollUsage(): Promise<void> {
 			tokens = await refreshTokens(tokens);
 		}
 
-		usageData     = await fetchUsage(tokens);
-		lastFetchTime = Date.now();
+		usageData      = await fetchUsage(tokens);
+		lastFetchTime  = Date.now();
+		fetchErrorCount = 0;
 	} catch {
 		// Keep stale data on error; silent fail — don't clutter the UI
+		fetchErrorCount++;
 	} finally {
 		isFetching = false;
 	}
@@ -283,9 +286,11 @@ export default function (pi: ExtensionAPI) {
 						if (extra?.is_enabled && typeof extra.utilization === "number") {
 							segments.push(D("ext ") + pct(Math.min(999, Math.floor(extra.utilization))));
 						}
-					} else {
+					} else if (fetchErrorCount < 3) {
+						// Still loading on first few attempts
 						segments.push(D("…"));
 					}
+					// else: API unreachable — omit the segment entirely rather than showing a stale spinner
 
 					segments.push(theme.fg("text", model));
 
