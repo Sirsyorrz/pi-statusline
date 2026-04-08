@@ -1,6 +1,6 @@
 {
   "name": "@sirsyorrz/pi-statusline",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pi statusline extension — clean one-line footer with context usage and Anthropic rate-limit utilization.",
   "license": "MIT",
   "author": "sirsyorrz",
