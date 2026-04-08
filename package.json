@@ -1,0 +1,29 @@
+{
+  "name": "@sirsyorrz/pi-statusline",
+  "version": "1.0.0",
+  "description": "Pi statusline extension — clean one-line footer with context usage and Anthropic rate-limit utilization.",
+  "license": "MIT",
+  "author": "sirsyorrz",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sirsyorrz/pi-statusline.git"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "statusline.ts"
+  ],
+  "exports": {
+    ".": "./statusline.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./statusline.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
