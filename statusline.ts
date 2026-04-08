@@ -247,7 +247,8 @@ export default function (pi: ExtensionAPI) {
 						theme.fg("accent", branch);
 
 					// ── right segments ────────────────────────────────────
-					const model = activeCtx.model?.id ?? "no model";
+					const model    = activeCtx.model?.id ?? "no model";
+					const provider = activeCtx.model?.provider;
 					const usage = activeCtx.getContextUsage();
 
 					const ctxTokens = usage?.tokens ?? null;
@@ -292,7 +293,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					// else: API unreachable — omit the segment entirely rather than showing a stale spinner
 
-					segments.push(theme.fg("text", model));
+					segments.push(theme.fg("text", model) + (provider ? D(` (${provider})`) : ""));
 
 					const right = " " + segments.join(SEP) + " ";
 
