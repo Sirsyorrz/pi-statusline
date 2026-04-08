@@ -1,0 +1,14 @@
+{
+  "name": "pi-statusline",
+  "version": "1.0.0",
+  "description": "Clean one-line status bar for pi with Anthropic API rate-limit utilization via cc-usage",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./statusline.ts"]
+  }
+}
