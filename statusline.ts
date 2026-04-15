@@ -11,9 +11,9 @@
  * snt  — Sonnet-only 7-day window utilization from Anthropic API.
  * ext  — extra usage/credits utilization (shown only when enabled).
  *
- * Rate-limit data is fetched from the Anthropic OAuth usage endpoint every 5 minutes.
- * Requires ~/.claude/.credentials.json (populated automatically by Claude Code).
- * Falls back to showing nothing for those fields if credentials are absent.
+ * Usage data is fetched every 5 min, cached to disk, and shown from cache on
+ * startup. If the API returns 429 (rate-limited) the poll interval doubles
+ * (up to 60 min) and resets to 5 min once a fetch succeeds again.
  *
  * Placement: ~/.pi/agent/extensions/statusline.ts  (global)
  *         or .pi/extensions/statusline.ts          (project-local)
@@ -23,14 +23,17 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 
-// ─── cc-usage config (mirrors burneikis/cc-usage) ───────────────────────────
-const POLL_INTERVAL_MS = 300_000; // 5 minutes
-const API_URL          = "https://api.anthropic.com/api/oauth/usage";
-const TOKEN_URL        = "https://platform.claude.com/v1/oauth/token";
-const CLIENT_ID        = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const CREDS_PATH       = join(homedir(), ".claude", ".credentials.json");
+// ─── Config ──────────────────────────────────────────────────────────────────
+const BASE_POLL_MS    = 300_000;          // 5 minutes (normal)
+const MAX_POLL_MS     = 3_600_000;        // 60 minutes (rate-limit cap)
+const API_URL         = "https://api.anthropic.com/api/oauth/usage";
+const TOKEN_URL       = "https://platform.claude.com/v1/oauth/token";
+const CLIENT_ID       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const PI_AUTH_PATH    = join(homedir(), ".pi", "agent", "auth.json");
+const CACHE_DIR       = join(homedir(), ".cache", "pi-statusline");
+const CACHE_PATH      = join(CACHE_DIR, "usage.json");
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 interface LimitInfo {
@@ -50,26 +53,47 @@ interface UsageData {
 	};
 }
 
+interface CacheFile {
+	fetchedAt: number;   // epoch ms
+	data: UsageData;
+}
+
 interface OAuthTokens {
 	accessToken: string;
 	refreshToken: string;
 	expiresAt?: number;
 }
 
-// ─── Token management ────────────────────────────────────────────────────────
-function readCreds(): Record<string, unknown> {
-	return JSON.parse(readFileSync(CREDS_PATH, "utf8")) as Record<string, unknown>;
+// ─── Disk cache ──────────────────────────────────────────────────────────────
+function loadCache(): CacheFile | null {
+	try {
+		return JSON.parse(readFileSync(CACHE_PATH, "utf8")) as CacheFile;
+	} catch {
+		return null;
+	}
 }
 
-function writeCreds(creds: Record<string, unknown>): void {
-	writeFileSync(CREDS_PATH, JSON.stringify(creds, null, 2), "utf8");
+function saveCache(data: UsageData): void {
+	try {
+		mkdirSync(CACHE_DIR, { recursive: true });
+		writeFileSync(CACHE_PATH, JSON.stringify({ fetchedAt: Date.now(), data }, null, 2), "utf8");
+	} catch {
+		// Non-fatal
+	}
 }
+
+// ─── Token management ────────────────────────────────────────────────────────
 
 function loadTokens(): OAuthTokens | null {
 	try {
-		const oauth = (readCreds()?.claudeAiOauth) as OAuthTokens | undefined;
-		if (!oauth?.accessToken) return null;
-		return oauth;
+		const raw = JSON.parse(readFileSync(PI_AUTH_PATH, "utf8")) as Record<string, unknown>;
+		const a = raw?.anthropic as { access?: string; refresh?: string; expires?: number } | undefined;
+		if (!a?.access) return null;
+		return {
+			accessToken:  a.access,
+			refreshToken: a.refresh ?? "",
+			expiresAt:    a.expires,
+		};
 	} catch {
 		return null;
 	}
@@ -111,9 +135,14 @@ async function refreshTokens(tokens: OAuthTokens): Promise<OAuthTokens> {
 	};
 
 	try {
-		const creds = readCreds();
-		creds.claudeAiOauth = newTokens;
-		writeCreds(creds);
+		const raw = JSON.parse(readFileSync(PI_AUTH_PATH, "utf8")) as Record<string, unknown>;
+		(raw.anthropic as Record<string, unknown>) = {
+			...(raw.anthropic as Record<string, unknown>),
+			access:  newTokens.accessToken,
+			refresh: newTokens.refreshToken,
+			expires: newTokens.expiresAt,
+		};
+		writeFileSync(PI_AUTH_PATH, JSON.stringify(raw, null, 2), "utf8");
 	} catch {
 		// Non-fatal — new tokens still valid in memory
 	}
@@ -132,17 +161,32 @@ async function fetchUsage(tokens: OAuthTokens): Promise<UsageData> {
 	});
 	if (!res.ok) {
 		const body = await res.text().catch(() => "");
-		throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+		// Attach status so the caller can detect 429
+		const err = new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+		(err as Error & { status: number }).status = res.status;
+		throw err;
 	}
 	return res.json() as Promise<UsageData>;
 }
 
-// ─── Usage poll state (module-level so it persists across re-mounts) ─────────
-let usageData: UsageData | null = null;
-let lastFetchTime  = 0;
+// ─── Poll state (module-level — persists across re-mounts) ───────────────────
+let usageData: UsageData | null        = null;
+let lastFetchTime  = 0;                // epoch ms of last successful fetch
 let isFetching     = false;
-let noCredentials  = false;   // true once we've confirmed creds are absent
-let fetchErrorCount = 0;      // consecutive failures; hides the spinner after a few tries
+let noCredentials  = false;
+let currentPollMs  = BASE_POLL_MS;    // may grow on 429
+let isRateLimited  = false;
+let rateLimitUntil = 0;               // epoch ms: earliest time to resume BASE_POLL_MS
+
+/** Set by session_start so the /usage-refresh command can restart the timer. */
+let scheduledKick: (() => void) | null = null;
+
+// Boot: load from disk cache immediately so data is visible before first fetch
+const cached = loadCache();
+if (cached) {
+	usageData     = cached.data;
+	lastFetchTime = cached.fetchedAt;
+}
 
 async function pollUsage(): Promise<void> {
 	if (isFetching) return;
@@ -159,22 +203,32 @@ async function pollUsage(): Promise<void> {
 			tokens = await refreshTokens(tokens);
 		}
 
-		usageData      = await fetchUsage(tokens);
-		lastFetchTime  = Date.now();
-		fetchErrorCount = 0;
-	} catch {
-		// Keep stale data on error; silent fail — don't clutter the UI
-		fetchErrorCount++;
+		usageData     = await fetchUsage(tokens);
+		lastFetchTime = Date.now();
+
+		// Successful fetch — restore normal interval
+		if (isRateLimited) {
+			currentPollMs  = BASE_POLL_MS;
+			isRateLimited  = false;
+			rateLimitUntil = 0;
+		}
+
+		saveCache(usageData);
+	} catch (err: unknown) {
+		const status = (err as Error & { status?: number }).status;
+		if (status === 429) {
+			// Exponential backoff on rate limit
+			isRateLimited  = true;
+			currentPollMs  = Math.min(currentPollMs * 2, MAX_POLL_MS);
+			rateLimitUntil = Date.now() + currentPollMs;
+		}
+		// Keep stale data; silent fail — don't clutter the UI
 	} finally {
 		isFetching = false;
 	}
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-/**
- * Format a reset countdown: "1h32m" or "45m" until the ISO timestamp.
- * Uses the system clock so it's always correct for the local timezone.
- */
 function fmtResetIn(isoStr: string | undefined): string | null {
 	if (!isoStr) return null;
 	const diffMs = new Date(isoStr).getTime() - Date.now();
@@ -184,7 +238,6 @@ function fmtResetIn(isoStr: string | undefined): string | null {
 	return h > 0 ? `↺${h}h${m}m` : `↺${m}m`;
 }
 
-/** Format a token count as a compact string: 0–999 as-is, then Xk, XM. */
 function fmtTokens(n: number): string {
 	if (n < 1_000)       return n.toString();
 	if (n < 10_000)      return `${(n / 1_000).toFixed(1)}k`;
@@ -193,7 +246,6 @@ function fmtTokens(n: number): string {
 	return `${Math.round(n / 1_000_000)}M`;
 }
 
-/** Replace $HOME with ~, keep at most 3 path segments. */
 function fmtDir(cwd: string): string {
 	const home = homedir();
 	let p = cwd.startsWith(home) ? "~" + cwd.slice(home.length) : cwd;
@@ -204,16 +256,32 @@ function fmtDir(cwd: string): string {
 	return p;
 }
 
-/** green → yellow → red based on percentage. */
 function pctColor(pct: number): "success" | "warning" | "error" {
 	return pct >= 80 ? "error" : pct >= 50 ? "warning" : "success";
+}
+
+/** How stale is the cached data? Returns a label like "~12m ago" or "~2h ago". */
+function stalenessLabel(fetchedAt: number): string {
+	const diffMs = Date.now() - fetchedAt;
+	const m = Math.round(diffMs / 60_000);
+	if (m < 60) return `~${m}m ago`;
+	const h = Math.floor(m / 60);
+	return `~${h}h ago`;
 }
 
 // ─── Extension entry point ───────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
 	let latestCtx: ExtensionContext | null = null;
 	let requestRenderFn: (() => void) | null = null;
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** Schedule the next poll; uses `currentPollMs` which may be inflated by 429. */
+	function schedulePoll(renderFn: () => void) {
+		if (pollTimer) clearTimeout(pollTimer);
+		pollTimer = setTimeout(() => {
+			pollUsage().then(() => renderFn()).catch(() => {}).finally(() => schedulePoll(renderFn));
+		}, currentPollMs);
+	}
 
 	function mountFooter(ctx: ExtensionContext) {
 		ctx.ui.setFooter((tui, theme, footerData) => {
@@ -226,14 +294,22 @@ export default function (pi: ExtensionAPI) {
 				render(width: number): string[] {
 					const activeCtx = latestCtx ?? ctx;
 
+					// Sync from disk cache if a newer fetch landed (e.g. from another module instance)
+					const diskCache = loadCache();
+					if (diskCache && diskCache.fetchedAt > lastFetchTime) {
+						usageData     = diskCache.data;
+						lastFetchTime = diskCache.fetchedAt;
+					}
+
 					// Trigger a background fetch if data is stale (non-blocking)
-					if (!isFetching && Date.now() - lastFetchTime > POLL_INTERVAL_MS) {
+					const staleness = Date.now() - lastFetchTime;
+					if (!isFetching && staleness > currentPollMs) {
 						pollUsage().then(() => tui.requestRender()).catch(() => {});
 					}
 
 					// ── helpers ───────────────────────────────────────────
-					const D   = (s: string) => theme.fg("dim", s);   // dim text
-					const SEP = D(" · ");                            // segment separator
+					const D   = (s: string) => theme.fg("dim", s);
+					const SEP = D(" · ");
 					const pct = (n: number) => theme.fg(pctColor(n), `(${n}%)`);
 
 					// ── left: dir + branch ────────────────────────────────
@@ -249,7 +325,7 @@ export default function (pi: ExtensionAPI) {
 					// ── right segments ────────────────────────────────────
 					const model    = activeCtx.model?.id ?? "no model";
 					const provider = activeCtx.model?.provider;
-					const usage = activeCtx.getContextUsage();
+					const usage    = activeCtx.getContextUsage();
 
 					const ctxTokens = usage?.tokens ?? null;
 					const ctxWindow = usage?.contextWindow ?? 0;
@@ -262,7 +338,7 @@ export default function (pi: ExtensionAPI) {
 						D("ctx ") + theme.fg(pctColor(ctxPct), ctxVal),
 					];
 
-					// API-sourced rate-limit utilization from cc-usage
+					// API-sourced rate-limit utilization
 					if (noCredentials) {
 						segments.push(D("no oauth"));
 					} else if (usageData) {
@@ -287,11 +363,19 @@ export default function (pi: ExtensionAPI) {
 						if (extra?.is_enabled && typeof extra.utilization === "number") {
 							segments.push(D("ext ") + pct(Math.min(999, Math.floor(extra.utilization))));
 						}
-					} else if (fetchErrorCount < 3) {
-						// Still loading on first few attempts
+
+						// Show staleness / rate-limit status as a subtle suffix
+						if (isRateLimited) {
+							const resumeIn = Math.max(0, Math.round((rateLimitUntil - Date.now()) / 60_000));
+							segments.push(D(`⚠ rl ${resumeIn}m`));
+						} else if (lastFetchTime > 0 && staleness > BASE_POLL_MS * 2) {
+							// Data is notably stale (>10 min) — show how old it is
+							segments.push(D(stalenessLabel(lastFetchTime)));
+						}
+					} else if (!isFetching) {
+						// First fetch still in progress or failed before cache was populated
 						segments.push(D("…"));
 					}
-					// else: API unreachable — omit the segment entirely rather than showing a stale spinner
 
 					segments.push(theme.fg("text", model) + (provider ? D(` (${provider})`) : ""));
 
@@ -307,23 +391,63 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	// ── commands ────────────────────────────────────────────────────────────
+	pi.registerCommand("usage-refresh", {
+		description: "Immediately refresh Claude API usage data and restart the poll timer.",
+		handler: async (_args, ctx) => {
+			try {
+				let tokens = loadTokens();
+				if (!tokens) {
+					ctx.ui.notify("No credentials found", "error");
+					return;
+				}
+				if (isExpired(tokens)) tokens = await refreshTokens(tokens);
+
+				const fresh = await fetchUsage(tokens);
+				usageData     = fresh;
+				lastFetchTime = Date.now();
+				isFetching    = false;
+				isRateLimited = false;
+				noCredentials = false;
+				rateLimitUntil = 0;
+				currentPollMs  = BASE_POLL_MS;
+				saveCache(fresh);
+				requestRenderFn?.();
+				scheduledKick?.();
+
+				const fh = fresh.five_hour?.utilization;
+				const sd = fresh.seven_day?.utilization;
+				ctx.ui.notify(`Usage refreshed ✓  5h ${fh != null ? Math.floor(fh) : "?"}%  7d ${sd != null ? Math.floor(sd) : "?"}%`, "info");
+			} catch (err) {
+				ctx.ui.notify(`Usage fetch failed: ${(err as Error).message?.slice(0, 100)}`, "error");
+			}
+		},
+	});
+
 	// ── lifecycle ───────────────────────────────────────────────────────────
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		mountFooter(ctx);
 
-		// Initial fetch, then periodic polling
+		// Initial fetch (cache already loaded at module init)
 		pollUsage().then(() => requestRenderFn?.()).catch(() => {});
-		pollTimer = setInterval(() => {
-			pollUsage().then(() => requestRenderFn?.()).catch(() => {});
-		}, POLL_INTERVAL_MS);
+
+		// Adaptive polling — uses currentPollMs so backoff is respected
+		function kick() {
+			if (pollTimer) clearTimeout(pollTimer);
+			pollTimer = setTimeout(() => {
+				pollUsage().then(() => requestRenderFn?.()).catch(() => {}).finally(kick);
+			}, currentPollMs);
+		}
+		scheduledKick = kick; // expose for /usage-refresh command
+		kick();
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		ctx.ui.setFooter(undefined);
 		requestRenderFn = null;
 		if (pollTimer) {
-			clearInterval(pollTimer);
+			clearTimeout(pollTimer);
 			pollTimer = null;
 		}
 	});
