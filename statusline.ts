@@ -233,7 +233,9 @@ function fmtResetIn(isoStr: string | undefined): string | null {
 	if (!isoStr) return null;
 	const diffMs = new Date(isoStr).getTime() - Date.now();
 	if (diffMs <= 0) return "↺now";
-	const h = Math.floor(diffMs / 3_600_000);
+	const totalH = Math.floor(diffMs / 3_600_000);
+	if (totalH >= 24) return `↺${Math.floor(totalH / 24)}d${totalH % 24}h`;
+	const h = totalH;
 	const m = Math.floor((diffMs % 3_600_000) / 60_000);
 	return h > 0 ? `↺${h}h${m}m` : `↺${m}m`;
 }
@@ -355,7 +357,11 @@ export default function (pi: ExtensionAPI) {
 							);
 						}
 						if (typeof sevenDay === "number") {
-							segments.push(D("7d ") + pct(Math.min(999, Math.floor(sevenDay))));
+							const resetStr = fmtResetIn(usageData.seven_day?.resets_at);
+							segments.push(
+								D("7d ") + pct(Math.min(999, Math.floor(sevenDay))) +
+								(resetStr ? " " + D(resetStr) : ""),
+							);
 						}
 						if (typeof snt === "number") {
 							segments.push(D("snt ") + pct(Math.min(999, Math.floor(snt))));
